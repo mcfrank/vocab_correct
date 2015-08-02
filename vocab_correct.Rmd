@@ -1,0 +1,359 @@
+---
+title: A generative model for vocabulary estimation
+author: "Mike Frank"
+date: "July 17, 2015"
+output:
+  html_document:
+  highlight: tango
+theme: spacelab
+---
+
+```{r setup, include=FALSE}
+library(knitr)
+opts_chunk$set(message=FALSE, warning=FALSE, cache=TRUE)
+```
+
+```{r, cache=FALSE, include=FALSE}
+library(dplyr)
+library(tidyr)
+# library(purrr)
+library(lazyeval)
+library(broom)
+library(readr)
+library(ggplot2)
+library(RCurl)
+library(langcog)
+library(wordbankr)
+theme_set(theme_bw(base_size = 14))
+inv.logit <- boot::inv.logit
+```
+
+First, connect to the Wordbank database and pull out the English WS and WG data.
+
+```{r}
+wordbank <- connect_to_wordbank()
+
+admins <- get_administration_data() %>%
+  filter(language == "English")
+
+items <- get_item_data() %>%
+  filter(language == "English", type == "word") %>%
+  select(item_id, form, category, lexical_category, item) %>%
+  mutate(num_item_id = as.numeric(substr(item_id, 6, nchar(item_id))))
+
+get_form_data <- function(input_language, input_form) {
+  form_items <- filter(items, form == input_form)
+  get_instrument_data(input_language, input_form, 
+                      form_items$item_id, iteminfo=form_items) %>%
+    mutate(produces = value == "produces",
+           understands = value == "understands" | value == "produces") %>%
+    select(-value) %>%
+    gather(measure, value, produces, understands) %>%
+    left_join(select(admins, data_id, age)) %>%
+    filter(!is.na(age)) %>%
+    mutate(form = input_form)
+}
+
+ws <- get_form_data("English", "WS") %>%
+  filter(measure == "produces")
+```
+
+Now aggregate by item. 
+
+```{r}
+items <- ws %>%
+  group_by(item, age) %>%
+  summarise(produces = mean(value, na.rm=TRUE))
+            
+write_csv(items, "ws.csv")
+```
+
+Now arrange.
+
+```{r}
+ordered <- items %>%
+  group_by() %>%
+  arrange(age, desc(produces)) %>%
+  group_by(age) %>%
+  mutate(index = 1:n()) 
+```
+
+Plot this with a glm sinusoid like in the Mayor & Plunkett (2011) paper.
+
+```{r}
+qplot(index, produces, facets= ~age, 
+      geom = "line",
+      data = ordered) + 
+  ylim(c(0,1)) + 
+  geom_smooth(method = "glm", 
+              family = "binomial",
+              formula = y ~ x) 
+```
+
+Try a polynomial fit.
+
+```{r}
+qplot(index, produces, facets= ~age, 
+      geom = "line",
+      data = ordered) + 
+  ylim(c(0,1)) + 
+  geom_smooth(method = "lm", 
+              family = "binomial",
+              color = "red",
+              formula = y ~ poly(x, 3)) 
+```
+
+Doesn't work that well for the younger ages, though looks fine later.
+
+Note age interactions in the stats.
+
+```{r}
+mp.glm <- glm(produces ~ index * age, family = "binomial", data = ordered)
+summary(mp.glm)
+```
+
+### Further thoughts on Mayor & Plunkett model
+
+The Mayor & Plunkett (2011) model has two corrections. The first uses the parametric form of the logistic to fill in low-frequency words that are not on the CDI, the second uses the difference between diary study counts and CDI counts to find a multiplier for higher-frequency words that are omitted. 
+
+I think there's a bit of a conceptual issue here, as these two corrections should essentially be the same thing - there are some words that are not on the CDI, and more of these are the low frequency/hard words. So really, it all is a correction for missing words. 
+
+Also - the first correction, which depends on the parametric form of the logistic, is much much smaller than the second. Take a look at this. 
+
+Equation 3:
+
+$$
+p(w_i) = 1 - \frac{1}{1 + e^{\frac{-(i-a)}{b}}}
+$$
+
+```{r}
+a <- 600 # from figure 6c for a 30mo
+b <- 180 # from figure 6c
+ranks <- 0:3000
+age <- 20
+ys <- (1 - (1 / (1 + exp((-(ranks - a ))/b))))
+
+qplot(ranks, ys, 
+      geom = "line") + 
+  geom_vline(xintercept = 680, lty = 2) +
+  geom_polygon(aes(x = c(ranks[ranks > 680], 
+                         rev(ranks[ranks > 680])),
+                   y = c(ys[ranks > 680], 
+                         rep(0, length(ranks[ranks > 680])))), 
+               fill = "blue", alpha = .5) + 
+  ylim(c(0,1))
+```
+
+So adding the gray area gives us
+
+$$
+V_{corr_1} = b \log (1 + e^(a / b))
+$$
+
+but then adding the second correction is just a multiplier on this:
+
+$$
+V_{corr_2} = \alpha * V_{corr_1}
+$$
+
+Note that (strikingly), M&P never give their value of $\alpha$ in the text. I estimate it below so that I can make an estimate of what correction 2 actually looks like... 
+
+```{r}
+a <- 600 
+b <- 180 
+ranks <- 1:3000
+age <- 20
+ys <- (1 - (1 / (1 + exp((-(ranks - a ))/b))))
+
+area.uncorrected <- sum(ys[1:680])
+area.c1 <- b * log(1 + exp(a / b))
+area.c2 <- 1142 # from lookup table A1
+alpha = area.c2 / area.c1
+
+ys2 <- (1 - (1 / (1 + exp((-(ranks - (a*alpha) ))/(alpha * b)))))
+area.corrected <- sum(ys2)
+
+qplot(ranks, ys, 
+      geom = "line") + 
+  geom_vline(xintercept = 680, lty = 2) +
+  geom_polygon(aes(x = c(ranks[ranks > 680], 
+                         rev(ranks[ranks > 680])),
+                   y = c(ys[ranks > 680], 
+                         rep(0, length(ranks[ranks > 680])))), 
+               fill = "blue", alpha = .5) + 
+  geom_line(aes(y = ys2), lty = 3) + 
+  geom_polygon(aes(x = c(ranks, rev(ranks)), 
+                y = c(ys2, rev(ys))), 
+            fill = "red", 
+            alpha = .5) + 
+  ylim(c(0,1)) 
+```
+
+So you can see that the second correction dwarfs the first correction in size, and is really based on a few small diary studies. 
+
+In sum, I'm worried about this model for a few reasons:
+
+* The distributional form (logit) is clearly not correct, so using this distributional form for extrapolation may have bad consequences.
+* The first and second corrections aren't conceptually distinct: they both concern missing words. Both have to do with the sampling of words on the CDI from the broader vocabulary. 
+* The second correction, which does most of the work, is - for reasonable reasons of data etc.- assumed to be a strict multiplier, which makes it do a ton of work at the higher end of vocabulary.
+
+McMurray Model
+--------------
+
+This is the normal distribution model from the McMurray (2007) "Defusing the Vocabulary Explosion" paper. Assume kids are $k$ and words $w$. Kids' abilities are a function of age ($a$). We model production probability $p$. 
+
+$$
+k_i \sim  \mathcal{N}(\mu_1, \sigma_1) \\
+w_j \sim \mathcal{N}(\mu_2, \sigma_2) \\
+k_i(a) = k_i * a \\
+p(k_i, w_j, a) = k_i(a) > w_j \\
+$$
+
+Try this with arbitrary parameters and make the same plot as above. 
+
+```{r}
+n.words <- 500
+n.kids <- 1000
+
+difficulty <- rnorm(n = n.words, m = 100, sd = 20)
+
+ability <- rnorm(n = n.kids, m = 4, sd = 1) 
+age <- 16:30
+
+sims <- expand.grid(difficulty = difficulty, ability = ability, age = age) %>%
+  group_by(ability, age) %>%
+  mutate(item = 1:n()) %>%
+  group_by() %>%
+  mutate(produces = difficulty < ability * age) %>%
+  group_by(item, age) %>%
+  summarise(produces = mean(produces)) %>%
+  group_by() %>%
+  arrange(age, desc(produces)) %>%
+  group_by(age) %>%
+  mutate(index = 1:n())
+              
+qplot(index, produces, facets = ~age, 
+      geom = "line", 
+      data = sims)
+```
+
+Cool - so this looks almost identical in distributional form! Just for kicks, let's plot these on top of one another. For now I'm just tweaking parameters, though all four ($\mu_1$, $\mu_2$, $\sigma_1$, and $\sigma_2$) matter to the fit. 
+```{r}
+n.words <- 680 # same as on the CDI
+n.kids <- 500 # reasonable number, so the curves are smoothish
+
+difficulty <- rnorm(n = n.words, m = 100, sd = 20)
+
+ability <- rnorm(n = n.kids, m = 4, sd = 1) 
+age <- 16:30
+
+sims <- expand.grid(difficulty = difficulty, ability = ability, age = age) %>%
+  group_by(ability, age) %>%
+  mutate(item = 1:n()) %>%
+  group_by() %>%
+  mutate(produces = difficulty < ability * age) %>%
+  group_by(item, age) %>%
+  summarise(produces = mean(produces)) %>%
+  group_by() %>%
+  arrange(age, desc(produces)) %>%
+  group_by(age) %>%
+  mutate(index = 1:n())
+
+sims$dataset <- "simulations"
+ordered$dataset <- "empirical WS"
+d <- bind_rows(select(sims, index, produces, age, dataset), 
+               select(ordered, index, produces, age, dataset))
+
+qplot(index, produces, facets = ~age, 
+      geom = "line", 
+      col = dataset,
+      data = d)
+```
+
+Extending the McMurray Model
+----------------------------
+
+So if the McMurray model is more or less the right model of vocabulary growth, how do we use knowledge about its parameters to correct CDI data? Two points here. 
+
+First, we have to define a process by which words are excluded and then estimate the parameters of the full model based on the CDI model. 
+
+Second, to do this we're still going to need some facts about total vocabulary to compare to the CDI vocabulary estimates, so we'll still need a study like Robinson & Mervis (1999). 
+
+So let's consider the McMurray model as the base of our generative model, having the steps:
+
+1. Generate a vocabulary with normally distributed difficulties, 
+2. Generate a set of kids with normally distributed learning rates, and 
+3. Generate a set of words to be on an instrument. 
+
+Let's consider a  model of selecting words for an instrument where the probability of selecting a word gradually decreases with its difficulty rank. The easiest words (e.g. momma, no, ball) will all be on the list, but only a smaller number of hard words will make it. 
+
+$$
+p_{inclusion}(i) \sim \operatorname{Bern} (\frac{1}{i^{\alpha}})
+$$
+
+So each word is included as a function of a Bernoulli draw (coin flip) with probability proportional to its rank.
+
+```{r}
+xs <- 1:100
+ys <- 1 / xs^(1/4)
+qplot(xs, ys)
+```
+
+So let's see what this looks like. We'll do the same generative process as before but this time with many more words, which we'll exclude at random. 
+
+```{r}
+n.words <- 4000
+n.kids <- 100
+alpha = .25
+
+difficulty <- rnorm(n = n.words, m = 100, sd = 20)
+ability <- rnorm(n = n.kids, m = 4, sd = 1) 
+age <- 16:30
+
+sims <- expand.grid(difficulty = difficulty, ability = ability, age = age) %>%
+  group_by(ability, age) %>%
+  mutate(item = 1:n()) %>%
+  group_by() %>%
+  mutate(produces = difficulty < ability * age) %>%
+  group_by(item, age) %>%
+  summarise(produces = mean(produces)) %>%
+  group_by() %>%
+  arrange(age, desc(produces)) %>%
+  group_by(age) %>%
+  mutate(index = 1:n())
+```
+
+Now choose the words to exclude, based on actual ground-truth difficulty.
+
+```{r}
+words.to.include <- expand.grid(difficulty = difficulty) %>%
+  mutate(item = 1:n()) %>%
+  arrange(difficulty) %>%
+  mutate(diff.idx = 1:n()) %>%
+  rowwise() %>%
+  mutate(inc = rbinom(1, size = 1, prob = 1/diff.idx^alpha) == 1) %>%
+  filter(inc)
+```
+
+First visualize this with the words, with red being more included words. 
+
+```{r}
+qplot(index, produces, facets = ~age, 
+      geom = "line", 
+      data = sims) + 
+  geom_vline(data = words.to.include, 
+             aes(xintercept = item), 
+             col = "red", alpha = .1)
+```
+
+Next show the curves with only those words included. 
+
+```{r}
+sims.subset <- filter(sims, item %in% words.to.include$item) %>%
+  
+  
+
+qplot(index, produces, facets = ~age, 
+      geom = "line", 
+      data = sims.subset)
+```
