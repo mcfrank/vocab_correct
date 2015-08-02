@@ -156,7 +156,7 @@ $$
 V_{corr_2} = \alpha * V_{corr_1}
 $$
 
-Note that (strikingly), M&P never give their value of $\alpha$ in the text. I estimate it below so that I can make an estimate of what correction 2 actually looks like... 
+Note that (strikingly), M&P2011 never give their value of $\alpha$ in the text. I estimate it below so that I can make an estimate of what correction 2 actually looks like... 
 
 ```{r}
 a <- 600 
@@ -330,9 +330,11 @@ words.to.include <- expand.grid(difficulty = difficulty) %>%
   mutate(item = 1:n()) %>%
   arrange(difficulty) %>%
   mutate(diff.idx = 1:n()) %>%
-  rowwise() %>%
+  rowwise %>%
   mutate(inc = rbinom(1, size = 1, prob = 1/diff.idx^alpha) == 1) %>%
-  filter(inc)
+  filter(inc) %>%
+  rowwise %>%
+  mutate(sim.idx = sims$index[sims$item == item][1])
 ```
 
 First visualize this with the words, with red being more included words. 
@@ -342,18 +344,40 @@ qplot(index, produces, facets = ~age,
       geom = "line", 
       data = sims) + 
   geom_vline(data = words.to.include, 
-             aes(xintercept = item), 
-             col = "red", alpha = .1)
+             aes(xintercept = sim.idx), 
+             col = "red", alpha = .03)
 ```
 
 Next show the curves with only those words included. 
 
 ```{r}
-sims.subset <- filter(sims, item %in% words.to.include$item) %>%
-  
-  
+sims.subset <- sims %>%
+  filter(item %in% words.to.include$item) %>%
+  mutate(index = 1:n())
 
+sims$dataset <- "full simulation"
+sims.subset$dataset <- "item subset"
+
+d <- bind_rows(sims, sims.subset)
+  
 qplot(index, produces, facets = ~age, 
-      geom = "line", 
-      data = sims.subset)
+      geom = "line", col = dataset,
+      data = d) 
 ```
+
+Now plot the multiplier in this simulation, which we can get based on the area under the curve. (As M&P2011 note, the area under the curve is the expected vocabulary estimate for that measure). 
+
+```{r}
+ms <- d %>%
+  group_by(age, dataset) %>%
+  summarise(produces = sum(produces))
+
+qplot(age, produces, col = dataset, 
+      geom = "line", data = ms) + 
+  geom_hline(yintercept = 680, lty = 2) + 
+  geom_hline(yintercept = 3000, lty = 2)
+```
+
+It's pretty clear that we're actually getting something similar to Bernard & Mervis (1999) here, and our correction isn't looking that dissimilar to M&P2011. Of course, this is all with six parameters I made up: $\mu_1$, $\mu_2$, $\sigma_1$, $\sigma_2$, $\alpha$ (the parameter on the words that got dropped), and $N_{total}$ (the total number of words we considered). But we (sort of) fit the first four to the empriical data. And the combo of $\alpha$ and $N_{total}$ wasn't totally invented either. 
+
+But really the next step is to use the empirical data and B&M1999 (plus other data) to fit this model, since with the addition of some hyper-priors it's a well-defined generative model. 
