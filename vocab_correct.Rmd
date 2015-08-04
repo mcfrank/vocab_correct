@@ -381,3 +381,134 @@ qplot(age, produces, col = dataset,
 It's pretty clear that we're actually getting something similar to Bernard & Mervis (1999) here, and our correction isn't looking that dissimilar to M&P2011. Of course, this is all with six parameters I made up: $\mu_1$, $\mu_2$, $\sigma_1$, $\sigma_2$, $\alpha$ (the parameter on the words that got dropped), and $N_{total}$ (the total number of words we considered). But we (sort of) fit the first four to the empriical data. And the combo of $\alpha$ and $N_{total}$ wasn't totally invented either. 
 
 But really the next step is to use the empirical data and B&M1999 (plus other data) to fit this model, since with the addition of some hyper-priors it's a well-defined generative model. 
+
+
+Inferring Model Parameters
+--------------------------
+
+Let's start slow, first defining the McMurray model. 
+
+```{r}
+stanmodelcode <-'
+data {                            
+  int<lower=1> W; // number of words
+  int<lower=1> S; // number of subjects
+  int<lower=1> N; // number of datapoints (W*S)
+  vector[S] age; // subject ages
+  int<lower=0,upper=1> produces[N]; // actual data
+}
+
+parameters {
+  real<lower=0> mu1; // word mean
+  real<lower=0> mu2; // subject mean
+  real<lower=0> sigma1; // word SD
+  real<lower=0> sigma2; // subject SD
+  vector[W] difficulty; // word mean
+  vector[S] ability; // subject mean
+}
+
+model {
+  difficulty ~ normal(mu1, sigma1);
+  ability ~ normal(mu2, sigma2);
+
+  for (s in 1:S)
+    for (w in 1:W)
+      produces[W*(s-1) + w] ~ bernoulli_logit((ability[s] * age[s]) - difficulty[w]);
+
+}
+'
+```
+
+Create data for stan model.
+
+```{r}
+library(rstan)
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+
+model.data <- ws %>%
+  select(data_id, num_item_id, value, age) %>%
+  filter(data_id < 10, num_item_id < 10) %>%
+  rename(produces = value)
+```
+
+Run the model and check diagnostics
+
+```{r}
+# initializing unbounded at zero or setting the range for random init values proved useful
+test <- stan(model_code = stanmodelcode, model_name = "mcmurray_simple", 
+             init=0,  
+             data = model.data, iter = 2000, warmup=200, thin=1, chains = 2, 
+             pars = c('Intercept','betaCond','IntRE', 'SlopeRE', 
+                      'phi', 'sd_int', 'sd_beta'), 
+             verbose = F, refresh=2000/4) 
+```
+
+diagnostics
+
+```{r}
+traceplot(test, inc=T)
+ainfo <- get_adaptation_info(test)
+cat(ainfo[[1]])
+samplerpar = get_sampler_params(test)[[1]]
+summary(samplerpar)
+pairs(test, pars=c('Intercept', 'betaCond'))
+
+# summary
+print(test, digits_summary=4)
+```
+
+Full run
+
+```{r}
+### set iterations etc.
+iters = 22000
+wu = 2000
+thin = 20
+nchains = 4
+
+### setup and run in parallel
+library(parallel)
+cl = makeCluster(4)
+
+clusterEvalQ(cl, library(rstan))
+clusterExport(cl, c('stanmodelcode', 'dat', 'test', 'iters', 'wu', 'thin')) 
+
+p = proc.time()
+parfit = parSapply(cl, 1:nchains, 
+                   function(i) stan(model_code = stanmodelcode, 
+                                    model_name = "mixedreg", 
+                                    init=0,       # see comment in test run
+                                    # init_r=.01, 
+                                    fit = test, 
+                                    data = dat, iter = iters, 
+                                    warmup=wu, thin=thin, chains = 1, 
+                                    chain_id=i,
+                                    verbose = T, refresh=iters/4), 
+                   simplify=F) 
+
+proc.time() - p
+
+stopCluster(cl)
+
+
+### combine the chains
+fit2 = sflist2stanfit(parfit)
+
+
+### examine some diagnostics
+ainfo = get_adaptation_info(fit2)
+cat(ainfo[[1]])
+samplerpar = get_sampler_params(fit2)[[1]]
+summary(samplerpar)
+
+
+### examine model
+print(fit2, pars = c('Intercept','betaCond','IntRE', 
+                     'SlopeRE', 'phi', 'sd_int', 'sd_beta', 'lp__'), 
+      digits=4, probs = c(.025, .5, 0.975))
+
+traceplot(fit2, inc_warmup=F, pars = c('Intercept','betaCond','IntRE',
+                                       'SlopeRE', 'phi', 'sd_int', 
+                                       'sd_beta', 'lp__'))
+```
