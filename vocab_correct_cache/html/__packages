@@ -1,0 +1,12 @@
+base
+knitr
+dplyr
+tidyr
+lazyeval
+broom
+readr
+ggplot2
+bitops
+RCurl
+langcog
+wordbankr
