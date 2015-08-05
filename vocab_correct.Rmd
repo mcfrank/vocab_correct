@@ -24,8 +24,19 @@ library(ggplot2)
 library(RCurl)
 library(langcog)
 library(wordbankr)
+library(stringr)
+
 theme_set(theme_bw(base_size = 14))
 inv.logit <- boot::inv.logit
+```
+
+We're going to use Stan. Set some settings:
+
+```{r}
+library(rstan)
+library(rstanmulticore)
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
 ```
 
 First, connect to the Wordbank database and pull out the English WS and WG data.
@@ -389,7 +400,7 @@ Inferring Model Parameters
 Let's start slow, first defining the McMurray model. 
 
 ```{r}
-stanmodelcode <-'
+mcmurray <-'
 data {                            
   int<lower=1> W; // number of words
   int<lower=1> S; // number of subjects
@@ -399,116 +410,369 @@ data {
 }
 
 parameters {
-  real<lower=0> mu1; // word mean
-  real<lower=0> mu2; // subject mean
-  real<lower=0> sigma1; // word SD
-  real<lower=0> sigma2; // subject SD
-  vector[W] difficulty; // word mean
-  vector[S] ability; // subject mean
+  real<lower=0> mu_w; // word mean
+  real<lower=0> mu_s; // subject mean
+  real<lower=0> sigma_w; // word SD
+  real<lower=0> sigma_s; // subject SD
+  real<lower=0> difficulty[W]; // word mean
+  real<lower=0> ability[S]; // subject mean
 }
 
 model {
-  difficulty ~ normal(mu1, sigma1);
-  ability ~ normal(mu2, sigma2);
+  mu_w ~ normal(0, 10); 
+  mu_s ~ normal(0, 10);
+  sigma_w ~ normal(0, 5);
+  sigma_s ~ normal(0, 5);
+  difficulty ~ normal(mu_w, sigma_w);
+  ability ~ normal(mu_s, sigma_s);
 
   for (s in 1:S)
     for (w in 1:W)
       produces[W*(s-1) + w] ~ bernoulli_logit((ability[s] * age[s]) - difficulty[w]);
-
 }
 '
 ```
 
-Create data for stan model.
+### Fake data simulations. 
+
+Let's start by doing simulations with fake data. These are six kids and five words, with the kids gradually increasing in age. Their abilities should be lower and lower, and words 1, 3, and 5 should be estimated as hard.  
 
 ```{r}
-library(rstan)
-rstan_options(auto_write = TRUE)
-options(mc.cores = parallel::detectCores())
-
-model.data <- ws %>%
-  select(data_id, num_item_id, value, age) %>%
-  filter(data_id < 10, num_item_id < 10) %>%
-  rename(produces = value)
+dat <- list(age = c(12, 14, 16, 18, 20, 22), 
+             produces = rep(c(0, 1, 0, 1, 0), 6), 
+             W = 5, 
+             S = 6, 
+             N = 30)
 ```
 
-Run the model and check diagnostics
+Run!
 
 ```{r}
-# initializing unbounded at zero or setting the range for random init values proved useful
-test <- stan(model_code = stanmodelcode, model_name = "mcmurray_simple", 
-             init=0,  
-             data = model.data, iter = 2000, warmup=200, thin=1, chains = 2, 
-             pars = c('Intercept','betaCond','IntRE', 'SlopeRE', 
-                      'phi', 'sd_int', 'sd_beta'), 
+samps <- pstan(model_code = mcmurray, model_name = "mcmurray_simple", 
+             data = dat, iter = 2000, warmup=200, thin=20, chains = 4, 
+             pars = c('mu_w','mu_s','sigma_w', 'sigma_s', 
+                      'difficulty', 'ability'), 
              verbose = F, refresh=2000/4) 
 ```
 
-diagnostics
+Now examine output. 
 
 ```{r}
-traceplot(test, inc=T)
-ainfo <- get_adaptation_info(test)
-cat(ainfo[[1]])
-samplerpar = get_sampler_params(test)[[1]]
-summary(samplerpar)
-pairs(test, pars=c('Intercept', 'betaCond'))
-
-# summary
-print(test, digits_summary=4)
+samps
 ```
 
-Full run
+Looks reasonable to me. 
+
+### Simulations with a subset of the data. 
+
+I started out these simulations looking at many words, and a small number of kids, and the results looked funky. Not sure if that's a convergence issue, or an issue with not having the appropriate diversity of kids. So let's try a smaller number of words.
 
 ```{r}
-### set iterations etc.
-iters = 22000
-wu = 2000
-thin = 20
-nchains = 4
+n.words <- 6
+n.subs <- 500
+  
+model.data <- ws %>%
+  filter(data_id <= n.subs, 
+         item %in% c("mommy","dog","up","table","truck","alligator")) %>%
+  select(data_id, num_item_id, item, value, age) %>%
+  rename(produces = value) %>%
+  arrange(data_id) # critical to get the words nested inside subjects
 
-### setup and run in parallel
-library(parallel)
-cl = makeCluster(4)
+# for simulations, fill in false for missing data
+model.data$produces[is.na(model.data$produces)] <- FALSE 
 
-clusterEvalQ(cl, library(rstan))
-clusterExport(cl, c('stanmodelcode', 'dat', 'test', 'iters', 'wu', 'thin')) 
+ages <- model.data %>% 
+              group_by(data_id) %>% 
+              summarise(age = mean(age)) %>% 
+              select(age) 
 
-p = proc.time()
-parfit = parSapply(cl, 1:nchains, 
-                   function(i) stan(model_code = stanmodelcode, 
-                                    model_name = "mixedreg", 
-                                    init=0,       # see comment in test run
-                                    # init_r=.01, 
-                                    fit = test, 
-                                    data = dat, iter = iters, 
-                                    warmup=wu, thin=thin, chains = 1, 
-                                    chain_id=i,
-                                    verbose = T, refresh=iters/4), 
-                   simplify=F) 
+dat <- list(age = ages$age, 
+            produces = model.data$produces, 
+            W = n.words, 
+            S = n.subs, 
+            N = n.words * n.subs)
 
-proc.time() - p
+model.data %>%
+  group_by(num_item_id) %>%
+  summarise(produces = mean(produces))
+```
 
-stopCluster(cl)
+Run the model.
 
+```{r}
+samps <- pstan(model_code = mcmurray, model_name = "mcmurray_simple", 
+             data = dat, iter = 2000, warmup=200, thin=20, chains = 4, 
+             pars = c('mu_w','mu_s','sigma_w', 'sigma_s', 
+                      'difficulty', 'ability'), 
+             verbose = F, refresh=2000/4) 
+```
 
-### combine the chains
-fit2 = sflist2stanfit(parfit)
+Diagnostics. Order of words is "alligator", "dog", "truck", "table", "mommy", "up."
 
-
-### examine some diagnostics
-ainfo = get_adaptation_info(fit2)
-cat(ainfo[[1]])
-samplerpar = get_sampler_params(fit2)[[1]]
+```{r}
+traceplot(samps, pars = c("mu_w", "mu_s", "sigma_w", "sigma_s"))
+samplerpar = get_sampler_params(samps)[[1]]
 summary(samplerpar)
+pairs(samps, pars=c('mu_w', 'mu_s'))
+```
 
+### Simulations with full dataset
 
-### examine model
-print(fit2, pars = c('Intercept','betaCond','IntRE', 
-                     'SlopeRE', 'phi', 'sd_int', 'sd_beta', 'lp__'), 
-      digits=4, probs = c(.025, .5, 0.975))
+We need to use only complete cases. But even here, these simulations take a while.
 
-traceplot(fit2, inc_warmup=F, pars = c('Intercept','betaCond','IntRE',
-                                       'SlopeRE', 'phi', 'sd_int', 
-                                       'sd_beta', 'lp__'))
+```{r}
+n.words <- 680
+
+complete <- ws %>%
+  group_by(data_id) %>%
+  summarize(complete = sum(!is.na(value)) == n.words) %>%
+  filter(complete)
+
+n.subs  <- 10
+
+model.data <- ws %>%
+  select(data_id, num_item_id, item, value, age) %>%
+  filter(data_id %in% complete$data_id) %>%
+  mutate(data_id = as.numeric(as.factor(data_id))) %>% # hack to renumber
+  filter(data_id <= n.subs) %>%
+  rename(produces = value) %>%
+  arrange(data_id) # critical to get the words nested inside subjects
+
+ages <- model.data %>% 
+              group_by(data_id) %>% 
+              summarise(age = mean(age)) %>% 
+              select(age) 
+
+dat <- list(age = ages$age, 
+            produces = model.data$produces, 
+            W = n.words, 
+            S = n.subs, 
+            N = n.words * n.subs)
+```
+
+Run the model. Unfortunately this takes around 45 minutes, even for 100 subjects. So do it for 10 (~90s). 
+
+```{r}
+samps <- pstan(model_code = mcmurray, model_name = "mcmurray_simple", 
+            data = dat, iter = 2000, warmup=200, thin=10, chains = 4, 
+             pars = c('mu_w','mu_s','sigma_w', 'sigma_s', 
+                      'difficulty', 'ability'), 
+             verbose = F, refresh=2000/4) 
+```
+
+Re-merge coefficients with word data.
+
+```{r}
+coefs <- data.frame(summary(samps)$summary)
+coefs$name <- rownames(coefs)
+
+word_ids <- ws %>% 
+  group_by(num_item_id) %>% 
+  summarise(item = unique(item))
+
+words <- coefs %>% 
+  filter(str_detect(name, "difficulty")) %>%
+  separate(name, c("name", "num_item_id"), "\\[") %>%
+  mutate(num_item_id = as.numeric(str_replace(num_item_id, "]", ""))) %>%
+  left_join(word_ids) %>%
+  select(mean, se_mean, sd, item) %>%
+  arrange(mean) %>%
+  mutate(item = factor(item, 
+                        levels = item,
+                        labels = item))
+```
+
+And plot the first 100 words or so... even within this, you can see that there is some good signal here and we are learning good stuff.  
+
+```{r}
+qplot(item, mean, data=words[1:100,]) + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+### Attempt #2: no by-subject coefficients
+
+The problem here is computational complexity. Let's rewrite the model so that we're not actually learning anything about each subject, just learning a mean and variance that gets multiplied by age. 
+
+```{r}
+mcmurray_nosubs <-'
+data {                            
+  int<lower=1> W; // number of words
+  int<lower=1> S; // number of subjects
+  int<lower=1> N; // number of datapoints (W*S)
+  vector[S] age; // subject ages
+  int<lower=0,upper=1> produces[N]; // actual data
+}
+
+parameters {
+  real<lower=0> mu_w; // word mean
+  real<lower=0> mu_s; // subject mean
+  real<lower=0> sigma_w; // word SD
+  real<lower=0> difficulty[W]; // word mean
+}
+
+model {
+  mu_w ~ normal(0, 10); 
+  mu_s ~ normal(0, 10);
+  sigma_w ~ normal(0, 5);
+  difficulty ~ normal(mu_w, sigma_w);
+
+  for (s in 1:S)
+    for (w in 1:W)
+      produces[W*(s-1) + w] ~ bernoulli_logit((mu_s * age[s]) - difficulty[w]);
+}
+'
+```
+
+Again, simulations with fake data. to begin These are six kids and five words, with the kids gradually increasing in age. Their abilities should be lower and lower, and words 1, 3, and 5 should be estimated as hard.  
+
+```{r}
+dat <- list(age = c(12, 14, 16, 18, 20, 22), 
+             produces = rep(c(0, 1, 0, 1, 0), 6), 
+             W = 5, 
+             S = 6, 
+             N = 30)
+```
+
+Run!
+
+```{r}
+samps <- pstan(model_code = mcmurray_nosubs, model_name = "mcmurray_nosubs", 
+             data = dat, iter = 2000, warmup=200, thin=20, chains = 4, 
+             pars = c('mu_w','mu_s','sigma_w', 'difficulty'), 
+             verbose = F, refresh=2000/4) 
+```
+
+Now examine output. 
+
+```{r}
+samps
+```
+
+Looks fine. On to a subset of the dataset.
+
+```{r}
+n.words <- 680
+
+complete <- ws %>%
+  group_by(data_id) %>%
+  summarize(complete = sum(!is.na(value)) == n.words) %>%
+  filter(complete)
+
+n.total.subs <- length(unique(ws$data_id))
+n.subs  <- 100
+
+model.data <- ws %>%
+  select(data_id, num_item_id, item, value, age) %>%
+  filter(data_id %in% complete$data_id) %>%
+  mutate(data_id = as.numeric(as.factor(data_id))) %>% # hack to renumber
+  filter(data_id %in% sample(n.total.subs)[1:n.subs]) %>%
+  rename(produces = value) %>%
+  arrange(data_id) # critical to get the words nested inside subjects
+
+ages <- model.data %>% 
+              group_by(data_id) %>% 
+              summarise(age = mean(age)) %>% 
+              select(age) 
+
+dat <- list(age = ages$age,
+            produces = model.data$produces, 
+            W = n.words, 
+            S = n.subs, 
+            N = n.words * n.subs)
+
+samps <- pstan(model_code = mcmurray_nosubs, model_name = "mcmurray_nosubs", 
+            data = dat, iter = 1000, warmup=100, thin=10, chains = 4, 
+             pars = c('mu_w','mu_s','sigma_w','difficulty'), 
+             verbose = F, refresh=2000/4) 
+
+samps
+```
+
+Now re-merge.
+
+```{r}
+coefs <- data.frame(summary(samps)$summary)
+coefs$name <- rownames(coefs)
+
+word_ids <- ws %>% 
+  group_by(num_item_id) %>% 
+  summarise(item = unique(item))
+
+words <- coefs %>% 
+  filter(str_detect(name, "difficulty")) %>%
+  separate(name, c("name", "num_item_id"), "\\[") %>%
+  mutate(num_item_id = as.numeric(str_replace(num_item_id, "]", ""))) %>%
+  left_join(word_ids) %>%
+  select(mean, se_mean, sd, item) %>%
+  arrange(mean) %>%
+  mutate(item = factor(item, 
+                        levels = item,
+                        labels = item))
+```
+
+and plot again:
+
+```{r}
+qplot(item, mean, data=words[1:50,]) + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+So clearly this model is getting us something. The only worry is that it's so slow. 
+
+Let's try rewriting it so it is more vectorized?
+
+### Attempt #3: Vectorized
+
+OK, try not fitting word coefficients. Does this even make sense?
+
+```{r}
+mcmurray_vectorized <-'
+data {                            
+  int<lower=1> N; // number of datapoints (W*S)
+  vector[N] age; // subject ages
+  int<lower=0,upper=1> produces[N]; // actual data
+}
+
+parameters {
+  real<lower=0> mu_w; // word mean
+  real<lower=0> mu_s; // subject mean
+}
+
+model {
+  mu_w ~ normal(0, 10); 
+  mu_s ~ normal(0, 10);
+  produces ~ bernoulli_logit(mu_s * age - mu_w);
+}
+'
+```
+
+```{r}
+n.words <- 680
+
+complete <- ws %>%
+  group_by(data_id) %>%
+  summarize(complete = sum(!is.na(value)) == n.words) %>%
+  filter(complete)
+
+n.total.subs <- length(unique(ws$data_id))
+n.subs  <- 100
+
+model.data <- ws %>%
+  select(data_id, num_item_id, item, value, age) %>%
+  filter(data_id %in% complete$data_id) %>%
+  mutate(data_id = as.numeric(as.factor(data_id))) %>% # hack to renumber
+  filter(data_id %in% sample(n.total.subs)[1:n.subs]) %>%
+  rename(produces = value) %>%
+  arrange(data_id) # critical to get the words nested inside subjects
+
+dat <- list(age = model.data$age,
+            produces = model.data$produces,
+            W = n.words, 
+            N = n.words * n.subs)
+
+samps <- stan(model_code = mcmurray_vectorized, 
+              model_name = "mcmurray_vectorized", 
+              data = dat, iter = 1000, warmup=100, thin=10, chains = 4, 
+              pars = c('mu_w','mu_s'), 
+              verbose = F, refresh=2000/4) 
 ```
