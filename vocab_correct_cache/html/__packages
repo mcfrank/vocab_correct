@@ -10,3 +10,8 @@ bitops
 RCurl
 langcog
 wordbankr
+Rcpp
+inline
+rstan
+rstanmulticore
+stringr
