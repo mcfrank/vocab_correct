@@ -717,34 +717,47 @@ qplot(item, mean, data=words[1:50,]) +
   theme(axis.text.x = element_text(angle = 90, hjust = 1))
 ```
 
-So clearly this model is getting us something. The only worry is that it's so slow. 
+So clearly this model is getting us something. The only worry is that it's still so slow. 
 
-Let's try rewriting it so it is more vectorized?
+Let's try rewriting it so it is more vectorized? Hard to do under current Stan infrastructure. 
 
-### Attempt #3: Vectorized
+### Attempt #3: Binomials
 
-OK, try not fitting word coefficients. Does this even make sense?
+But we can do an age aggregation and use binomials. (Since we're not fitting subjects). 
 
 ```{r}
-mcmurray_vectorized <-'
+mcmurray_binom <-'
 data {                            
-  int<lower=1> N; // number of datapoints (W*S)
-  vector[N] age; // subject ages
-  int<lower=0,upper=1> produces[N]; // actual data
+  int<lower=1> W; // number of words
+  int<lower=1> A; // number of ages
+  int<lower=1> N; // number of datapoints (W*A)
+  vector[A] age; // subject ages
+  int produces[N]; // count data
+  int attempts[N]; // count data
 }
 
 parameters {
   real<lower=0> mu_w; // word mean
   real<lower=0> mu_s; // subject mean
+  real<lower=0> sigma_w; // word SD
+  real<lower=0> difficulty[W]; // word mean
 }
 
 model {
   mu_w ~ normal(0, 10); 
   mu_s ~ normal(0, 10);
-  produces ~ bernoulli_logit(mu_s * age - mu_w);
+  sigma_w ~ normal(0, 5);
+  difficulty ~ normal(mu_w, sigma_w);
+
+  for (a in 1:A)
+    for (w in 1:W) 
+      produces[W*(a-1) + w] ~ binomial_logit(attempts[W*(a-1) + w], (mu_s * age[a]) - difficulty[w]);
 }
 '
 ```
+
+Now run this with the full dataset. 
+Interestingly, thinning is not recommended by many authors: see [http://doingbayesiandataanalysis.blogspot.ca/2011/11/thinning-to-reduce-autocorrelation.html]
 
 ```{r}
 n.words <- 680
@@ -754,25 +767,81 @@ complete <- ws %>%
   summarize(complete = sum(!is.na(value)) == n.words) %>%
   filter(complete)
 
-n.total.subs <- length(unique(ws$data_id))
-n.subs  <- 100
 
 model.data <- ws %>%
   select(data_id, num_item_id, item, value, age) %>%
   filter(data_id %in% complete$data_id) %>%
-  mutate(data_id = as.numeric(as.factor(data_id))) %>% # hack to renumber
-  filter(data_id %in% sample(n.total.subs)[1:n.subs]) %>%
-  rename(produces = value) %>%
-  arrange(data_id) # critical to get the words nested inside subjects
+  group_by(age, num_item_id) %>%
+  summarise(n = sum(value), 
+            N = length(value))
 
-dat <- list(age = model.data$age,
-            produces = model.data$produces,
+ages <- unique(model.data$age)
+
+dat <- list(age = ages,
+            produces = model.data$n, 
+            attempts = model.data$N,             
             W = n.words, 
-            N = n.words * n.subs)
+            A = length(ages), 
+            N = n.words * length(ages))
 
-samps <- stan(model_code = mcmurray_vectorized, 
-              model_name = "mcmurray_vectorized", 
-              data = dat, iter = 1000, warmup=100, thin=10, chains = 4, 
-              pars = c('mu_w','mu_s'), 
-              verbose = F, refresh=2000/4) 
+ptm <- proc.time()
+samps <- stan(model_code = mcmurray_binom, 
+              cores = 4, 
+              data = dat, iter = 300, warmup=100, thin=10, chains = 24, 
+              pars = c("mu_w", "mu_s", "sigma_w", "difficulty")) 
+proc.time() - ptm
+
+```
+
+Diagnostics.
+
+```{r}
+traceplot(samps, pars = c('mu_w','mu_s','sigma_w'))
+
+```
+
+Success!
+
+```{r}
+coefs <- data.frame(summary(samps)$summary)
+coefs$name <- rownames(coefs)
+
+word_ids <- ws %>% 
+  group_by(num_item_id) %>% 
+  summarise(item = unique(item))
+
+words <- coefs %>% 
+  filter(str_detect(name, "difficulty")) %>%
+  separate(name, c("name", "num_item_id"), "\\[") %>%
+  mutate(num_item_id = as.numeric(str_replace(num_item_id, "]", ""))) %>%
+  left_join(word_ids) %>%
+  select(mean, se_mean, sd, item) %>%
+  arrange(mean) %>%
+  mutate(item = factor(item, 
+                        levels = item,
+                        labels = item))
+```
+
+and plot again:
+
+```{r}
+qplot(mean, as.numeric(item), 
+      geom = "point", data=words) + 
+  geom_text(aes(x = mean + .2, label = item), 
+            data = words[seq(1,680, 10),], 
+            size = 2)
+```
+
+Check the histogram:
+
+```{r}
+qplot(mean, geom = "blank", data = words) + 
+  geom_histogram(aes(y = ..density..)) + 
+  geom_density(col = "red")
+```
+
+What are the words with means below 1?
+
+```{r}
+filter(words, mean < 1)
 ```
